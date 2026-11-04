@@ -68,6 +68,10 @@ class HardStop(Exception):
     """验证墙、403、或连续失败。调用方应停下来，不要绕过。"""
 
 
+class Transient(HardStop):
+    """网络错误或 5xx 退避耗尽。和 HardStop 一样中止本轮，但常驻进程按轮询间隔重试，不进入验证冷却。"""
+
+
 def validate_request_delay(delay: float) -> float:
     if delay < MIN_REQUEST_DELAY_SECONDS:
         raise ValueError(
@@ -190,20 +194,19 @@ def page_frontier(
 ) -> tuple[list[dict], bool]:
     """返回本页尚未入库的公告，以及翻完本页后是否停止。
 
-    本页出现任一已入库 code 就停止。该 catalog 还没有任何行时也停止，
+    整页都已入库才停止，和原脚本一致：列表偶尔不按时间排序，或某篇正文上轮没拉到时，
+    有新旧混排的页仍会继续往后翻。该 catalog 还没有任何行时也停止，
     这样空表只会留下首页，不会把整段历史再请求一遍。
     """
     fresh: list[dict] = []
-    saw_stored = False
     for item in articles:
         code = item.get("code")
         if not isinstance(code, str) or not code:
             continue
         if code in stored_codes:
-            saw_stored = True
             continue
         fresh.append(item)
-    if not articles or catalog_empty or saw_stored:
+    if not articles or catalog_empty or not fresh:
         return fresh, True
     return fresh, False
 
@@ -552,7 +555,7 @@ class Client:
                     self._rebuild_opener()
                     logger.info("TLS 握手异常，后续请求改用 TLS 1.2（仍校验证书）。")
                 if backoff_i >= MAX_BACKOFF_TRIES:
-                    raise HardStop(f"网络错误重试耗尽：{exc}") from exc
+                    raise Transient(f"网络错误重试耗尽：{exc}") from exc
                 wait = BACKOFF_SECS[backoff_i]
                 logger.warning(
                     "网络错误，%ss 后重试（%s/%s）：%s",
@@ -572,7 +575,9 @@ class Client:
             if status == 429 or status >= 500:
                 if backoff_i >= MAX_BACKOFF_TRIES:
                     self.note_bad()
-                    raise HardStop(f"HTTP {status} 退避耗尽，已停止。")
+                    if status == 429:
+                        raise HardStop(f"HTTP {status} 退避耗尽，已停止。")
+                    raise Transient(f"HTTP {status} 退避耗尽，已停止。")
                 wait = BACKOFF_SECS[backoff_i]
                 logger.warning(
                     "HTTP %s，%ss 后重试（%s/%s）",

@@ -1,11 +1,18 @@
-"""Write a few fixture rows through a running duckport-server, then delete them."""
+"""Write a few fixture rows through a running duckport-server, then delete them.
+
+Opt-in: set DUCKPORT_TEST_ADDR (host:port) to a throwaway server. The plugin's own
+DUCKPORT_ADDR is not used, because on a duckport host it resolves to the production
+server from /opt/duckport/server.env, and this test creates the table, its watermark
+and table_specs rows there.
+"""
 
 import json
+import os
 import socket
 
 import pytest
 
-from binance_announcements.config import DUCKPORT_ADDR, DUCKPORT_SCHEMA, TABLE_NAME
+from binance_announcements.config import DUCKPORT_SCHEMA, TABLE_NAME
 from binance_announcements.duckport_client import DuckportClient
 from binance_announcements.loadhist import import_jsonl_dir
 
@@ -13,6 +20,9 @@ FIXTURE_CODES = (
     "dpfixture00000000000000000000000a",
     "dpfixture00000000000000000000000b",
 )
+
+
+DUCKPORT_ADDR = os.getenv("DUCKPORT_TEST_ADDR", "")
 
 
 def _server_reachable() -> bool:
@@ -64,6 +74,8 @@ def _quoted_codes() -> str:
 
 
 def test_fixture_import_is_idempotent(tmp_path):
+    if not DUCKPORT_ADDR:
+        pytest.skip("未设置 DUCKPORT_TEST_ADDR（指向一次性 duckport-server，不要用生产实例）")
     if not _server_reachable():
         pytest.skip(f"duckport-server 未监听 {DUCKPORT_ADDR}")
     client = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA)

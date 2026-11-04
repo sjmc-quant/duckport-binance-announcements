@@ -17,6 +17,7 @@ from binance_announcements.duckport_client import DuckportClient
 from binance_announcements.fetch import (
     Client,
     HardStop,
+    Transient,
     collect_new_from_list,
     iter_detail_records,
     record_payload_bytes,
@@ -79,6 +80,11 @@ class AnnouncementJobs:
         while not self._stop.is_set():
             try:
                 self.poll_once(http)
+            except Transient as exc:
+                logger.warning("%s；%s 秒后再试", exc, POLL_INTERVAL_SECONDS)
+                if self._stop.wait(POLL_INTERVAL_SECONDS):
+                    return
+                continue
             except HardStop as exc:
                 logger.error("%s；%s 秒后再试", exc, CHALLENGE_COOLDOWN_SECONDS)
                 if self._stop.wait(CHALLENGE_COOLDOWN_SECONDS):
@@ -93,6 +99,8 @@ class AnnouncementJobs:
                 return
 
     def poll_once(self, http: Client) -> None:
+        # 连续失败只在一轮之内累计；上一轮冷却前的计数不带进新一轮。
+        http.consecutive_bad = 0
         known = self.client.read_known_codes()
         wrote = False
         try:

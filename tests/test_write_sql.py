@@ -1,4 +1,6 @@
 import pyarrow as pa
+import pyarrow.flight as flight
+import pytest
 
 from binance_announcements.duckport_client import (
     COL_DEFS,
@@ -81,3 +83,30 @@ def test_to_arrow_forces_strings_and_microsecond_timestamps():
 def test_split_empty_table():
     empty = pa.table({"body": pa.array([], type=pa.string())})
     assert split_arrow_by_bytes(empty, target_bytes=100) == []
+
+
+class _FlightRaising:
+    def __init__(self, exc: Exception):
+        self.exc = exc
+
+    def do_get(self, ticket):
+        raise self.exc
+
+
+def _client_raising(exc: Exception) -> DuckportClient:
+    client = DuckportClient.__new__(DuckportClient)
+    client.schema = "data"
+    client.client = _FlightRaising(exc)
+    return client
+
+
+def test_zero_row_query_reads_as_empty_table():
+    client = _client_raising(flight.FlightInternalError("Server never sent a data message"))
+    assert client.query("SELECT 1 WHERE false").num_rows == 0
+    assert client.read_known_codes() == {}
+
+
+def test_other_internal_errors_still_raise():
+    client = _client_raising(flight.FlightInternalError("Catalog Error: Table does not exist"))
+    with pytest.raises(flight.FlightInternalError):
+        client.read_known_codes()
