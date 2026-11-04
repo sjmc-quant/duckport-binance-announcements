@@ -1,5 +1,6 @@
 import json
 import threading
+import urllib.error
 import urllib.parse
 
 import pandas as pd
@@ -7,11 +8,15 @@ import pytest
 
 from binance_announcements.config import (
     CHALLENGE_COOLDOWN_SECONDS,
+    POLL_INTERVAL_SECONDS,
     parse_catalogs,
 )
 from binance_announcements.data_jobs import AnnouncementJobs
+from binance_announcements import fetch
 from binance_announcements.fetch import (
+    Client,
     HardStop,
+    Transient,
     collect_backfill_from_list,
     collect_new_from_list,
     extract_body_text,
@@ -108,10 +113,14 @@ def test_ms_to_utc_and_frame_strings():
     assert frame.loc[0, "lang"] == "zh-CN"
 
 
-def test_page_frontier_stops_on_overlap_and_empty_catalog():
+def test_page_frontier_stops_only_on_page_without_new_and_empty_catalog():
     articles = [{"code": "new"}, {"code": "old"}]
     fresh, stop = page_frontier(articles, {"old"}, catalog_empty=False)
     assert [item["code"] for item in fresh] == ["new"]
+    assert stop is False
+
+    fresh, stop = page_frontier([{"code": "old"}], {"old"}, catalog_empty=False)
+    assert fresh == []
     assert stop is True
 
     fresh, stop = page_frontier([{"code": "a"}, {"code": "b"}], set(), catalog_empty=False)
@@ -200,17 +209,35 @@ def test_backfill_stops_at_reported_total():
     assert [item["code"] for item in pending] == ["n1", "n2"]
 
 
-def test_collect_stops_at_first_overlapping_page():
+def test_collect_stops_at_first_page_without_new():
     http = _FakeHttp(
         [
             [{"code": "n1"}, {"code": "n2"}],
             [{"code": "n3"}, {"code": "old"}],
+            [{"code": "old2"}, {"code": "old3"}],
             [{"code": "should-not-fetch"}],
         ]
     )
-    _, pending = collect_new_from_list(http, 49, {"old"}, catalog_empty=False)
-    assert http.calls == 2
+    _, pending = collect_new_from_list(http, 49, {"old", "old2", "old3"}, catalog_empty=False)
+    assert http.calls == 3
     assert [item["code"] for item in pending] == ["n1", "n2", "n3"]
+
+
+def test_collect_keeps_paging_past_mixed_page():
+    # 列表不按时间排序或上轮正文没拉到时，新公告可能排在已入库的公告后面一页。
+    http = _FakeHttp(
+        [
+            [{"code": "n1"}, {"code": "old1"}],
+            [{"code": "old2"}, {"code": "n2"}],
+            [{"code": "old3"}],
+            [{"code": "should-not-fetch"}],
+        ]
+    )
+    _, pending = collect_new_from_list(
+        http, 48, {"old1", "old2", "old3"}, catalog_empty=False
+    )
+    assert http.calls == 3
+    assert [item["code"] for item in pending] == ["n1", "n2"]
 
 
 def test_jsonl_skips_bad_lines(tmp_path):
@@ -273,3 +300,84 @@ def test_hardstop_waits_for_cooldown_instead_of_exiting():
     jobs.poll_once = poll_once
     jobs._loop()
     assert waited == [CHALLENGE_COOLDOWN_SECONDS]
+
+
+class _RaisingOpener:
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.calls = 0
+
+    def open(self, req, timeout=None):
+        self.calls += 1
+        raise self.exc
+
+
+def _client_with(monkeypatch, exc: Exception) -> tuple[Client, _RaisingOpener]:
+    monkeypatch.setattr(fetch.time, "sleep", lambda _seconds: None)
+    http = Client(delay=2.0)
+    opener = _RaisingOpener(exc)
+    http._opener = opener
+    return http, opener
+
+
+def test_network_error_exhaustion_is_transient(monkeypatch):
+    http, opener = _client_with(monkeypatch, urllib.error.URLError("connection refused"))
+    with pytest.raises(Transient):
+        http.get_json("https://example.invalid/")
+    assert opener.calls == fetch.MAX_BACKOFF_TRIES + 1
+
+
+def test_5xx_exhaustion_is_transient(monkeypatch):
+    exc = urllib.error.HTTPError("https://example.invalid/", 503, "busy", None, None)
+    http, _ = _client_with(monkeypatch, exc)
+    with pytest.raises(Transient):
+        http.get_json("https://example.invalid/")
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_403_and_429_are_hard_stops(monkeypatch, status):
+    exc = urllib.error.HTTPError("https://example.invalid/", status, "no", None, None)
+    http, _ = _client_with(monkeypatch, exc)
+    with pytest.raises(HardStop) as info:
+        http.get_json("https://example.invalid/")
+    assert not isinstance(info.value, Transient)
+
+
+def test_transient_waits_for_poll_interval_not_cooldown():
+    waited: list[float | None] = []
+
+    class _Stop(threading.Event):
+        def wait(self, timeout=None):
+            waited.append(timeout)
+            return True
+
+    jobs = AnnouncementJobs.__new__(AnnouncementJobs)
+    jobs._stop = _Stop()
+    jobs._http = None
+
+    def poll_once(http):
+        raise Transient("网络错误重试耗尽：connection refused")
+
+    jobs.poll_once = poll_once
+    jobs._loop()
+    assert waited == [POLL_INTERVAL_SECONDS]
+
+
+def test_poll_once_resets_consecutive_bad():
+    class _Client:
+        def read_known_codes(self):
+            return {}
+
+        def sync_duck_time(self):
+            pass
+
+    class _Http:
+        stop_after = True
+        consecutive_bad = fetch.MAX_CONSECUTIVE_BAD
+
+    jobs = AnnouncementJobs.__new__(AnnouncementJobs)
+    jobs.client = _Client()
+    jobs._stop = threading.Event()
+    http = _Http()
+    jobs.poll_once(http)
+    assert http.consecutive_bad == 0

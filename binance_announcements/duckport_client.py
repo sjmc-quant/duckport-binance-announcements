@@ -26,6 +26,10 @@ from binance_announcements.fetch import ANNOUNCEMENT_COLUMNS
 
 logger = logging.getLogger(__name__)
 
+# duckport-server answers a query with zero rows by closing the stream without a data
+# message; pyarrow surfaces that as FlightInternalError with this text.
+_ZERO_ROW_MESSAGE = "never sent a data message"
+
 COLUMN_TYPES = {
     "id": "BIGINT",
     "code": "VARCHAR",
@@ -271,11 +275,16 @@ class DuckportClient:
             raise ValueError("duckport.query 只接受 SELECT、WITH 或 EXPLAIN")
         ticket = json.dumps({"type": "duckport.query", "sql": sql}).encode("utf-8")
         try:
-            reader = self.client.do_get(flight.Ticket(ticket))
-        except flight.FlightUnavailableError:
-            self._reconnect()
-            reader = self.client.do_get(flight.Ticket(ticket))
-        return reader.read_all()
+            try:
+                reader = self.client.do_get(flight.Ticket(ticket))
+            except flight.FlightUnavailableError:
+                self._reconnect()
+                reader = self.client.do_get(flight.Ticket(ticket))
+            return reader.read_all()
+        except flight.FlightInternalError as exc:
+            if _ZERO_ROW_MESSAGE in str(exc):
+                return pa.table({})
+            raise
 
     def init_schema(self) -> None:
         schema = self.schema
