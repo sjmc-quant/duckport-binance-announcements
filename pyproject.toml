@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binance-announcements"
+version = "0.1.0"
+description = "Binance support announcement ingestor for duckport-rs"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.0",
+    "pyarrow>=15.0",
+    "python-dotenv>=1.0",
+    "duckdb==1.5.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["binance_announcements*"]
+
+[project.scripts]
+binance-announcements = "binance_announcements.main:main"
+loadhist = "binance_announcements.loadhist:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
